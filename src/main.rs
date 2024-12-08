@@ -145,7 +145,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let error_msg = "
 ╔════════════════════════════════════════════════════════════════╗
-║                         ERROR                                   ║
+║                         ERROR                                  ║
 ║ OPENROUTER_API_KEY environment variable is not set             ║
 ║                                                                ║
 ║ Please set it by running:                                      ║
