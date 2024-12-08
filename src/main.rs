@@ -1,12 +1,23 @@
 // MIT License
-
 /* Copyright (c) 2024 Based Labs
 
-Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
+of the Software, and to permit persons to whom the Software is furnished to do so,
+subject to the following conditions:
 
-The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+The above copyright notice and this permission notice shall be included in
+all copies or substantial portions of the Software.
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE. */
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
+THE SOFTWARE. */
 
 mod api;
 mod models;
@@ -29,15 +40,42 @@ use std::sync::Arc as StdArc;
 use futures::future;
 use serde_json::json;
 use tokio::sync::mpsc::{self, Sender};
+use std::io::ErrorKind;
 
 use crate::utils::animations::{AnimationStyle, AnimationConfig, ThinkingAnimation};
 
-const DEFAULT_INITIAL_CELLS: usize = 32;
+/// Configuration struct to group key parameters in one place.
+struct Config {
+    initial_cells: usize,
+    batch_size: usize,
+    cell_init_delay_ms: u64,
+    cycle_delay_ms: u64,
+}
+
+/// Default values taken from existing constants
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            initial_cells: 32, // from DEFAULT_INITIAL_CELLS
+            batch_size: BATCH_SIZE,
+            cell_init_delay_ms: CELL_INIT_DELAY_MS,
+            cycle_delay_ms: CYCLE_DELAY_MS,
+        }
+    }
+}
+
+/// A small helper function to run animations, reducing code repetition.
+async fn run_animation(config: AnimationConfig) -> Result<(), Box<dyn std::error::Error>> {
+    let animation = ThinkingAnimation::new(config);
+    animation.run().await?;
+    Ok(())
+}
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    crate::utils::logging::ensure_data_directories()
-        .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, e.to_string())) as Box<dyn std::error::Error>)?;
+    crate::utils::logging::ensure_data_directories().map_err(|e| {
+        Box::new(std::io::Error::new(ErrorKind::Other, e.to_string())) as Box<dyn std::error::Error>
+    })?;
 
     let running = StdArc::new(AtomicBool::new(true));
     let r = running.clone();
@@ -53,34 +91,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let init_animation = ThinkingAnimation::new(init_config);
 
+    // Handle shutdown signals
     tokio::spawn(async move {
-        let mut sigterm = tokio::signal::unix::signal(
+        let mut sigterm = match tokio::signal::unix::signal(
             tokio::signal::unix::SignalKind::terminate()
-        ).expect("Failed to set up SIGTERM handler");
-        
+        ) {
+            Ok(sig) => sig,
+            Err(e) => {
+                eprintln!("Failed to set up SIGTERM handler: {}", e);
+                return;
+            }
+        };
+
         tokio::select! {
             _ = ctrl_c() => {
-                let shutdown_animation = ThinkingAnimation::new(AnimationConfig {
+                let shutdown_animation = AnimationConfig {
                     style: AnimationStyle::Progress,
                     message: "Shutting down...".to_string(),
                     delay: Duration::from_millis(100),
-                });
-                shutdown_animation.run().await.unwrap();
-                
+                };
+                if let Err(e) = run_animation(shutdown_animation).await {
+                    eprintln!("Error running shutdown animation: {}", e);
+                }
+
+                // If send fails, just print error and continue
                 for _ in 0..2 {
-                    shutdown_tx_clone.send(()).unwrap();
+                    if let Err(e) = shutdown_tx_clone.send(()) {
+                        eprintln!("Failed to send shutdown signal: {}", e);
+                    }
                 }
                 println!("\nIf the process doesn't exit cleanly, force quit with:");
                 println!("sudo kill -9 $(pgrep -fl 'creature' | awk '{{print $1}}')");
             }
             _ = sigterm.recv() => {
-                let shutdown_animation = ThinkingAnimation::new(AnimationConfig {
+                let shutdown_animation = AnimationConfig {
                     style: AnimationStyle::Progress,
                     message: "Received SIGTERM".to_string(),
                     delay: Duration::from_millis(100),
-                });
-                shutdown_animation.run().await.unwrap();
-                
+                };
+                if let Err(e) = run_animation(shutdown_animation).await {
+                    eprintln!("Error running SIGTERM shutdown animation: {}", e);
+                }
+
                 for _ in 0..2 {
                     if let Err(e) = shutdown_tx_clone.send(()) {
                         eprintln!("Failed to send shutdown signal: {}", e);
@@ -91,8 +143,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         r.store(false, Ordering::SeqCst);
     });
 
-    let api_key = std::env::var("OPENROUTER_API_KEY").map_err(|_| {
-        let error_msg = "
+    let error_msg = "
 ╔════════════════════════════════════════════════════════════════╗
 ║                         ERROR                                   ║
 ║ OPENROUTER_API_KEY environment variable is not set             ║
@@ -104,8 +155,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ║ https://openrouter.ai/keys                                     ║
 ╚════════════════════════════════════════════════════════════════╝
 ";
+
+    let api_key = std::env::var("OPENROUTER_API_KEY").map_err(|_| {
         eprintln!("{}", error_msg);
-        std::io::Error::new(std::io::ErrorKind::NotFound, "OPENROUTER_API_KEY not set")
+        std::io::Error::new(ErrorKind::NotFound, "OPENROUTER_API_KEY not set")
     })?;
 
     let matches = App::new("Creature")
@@ -138,16 +191,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .takes_value(true))
         .get_matches();
 
-    let initial_cells = matches.value_of("cells")
-        .and_then(|c| c.parse().ok())
-        .unwrap_or(DEFAULT_INITIAL_CELLS);
+    let mut config = Config::default();
+    if let Some(c) = matches.value_of("cells").and_then(|c| c.parse::<usize>().ok()) {
+        config.initial_cells = c;
+    }
 
     let mission = matches.value_of("mission")
         .unwrap_or("Develop innovative AI collaboration systems with focus on real-time adaptation")
         .to_string();
-        
+
     let colony_name = matches.value_of("name").unwrap_or("Unnamed");
-    
 
     let api_client = api::openrouter::OpenRouterClient::new(api_key.clone())
         .map_err(|e| e as Box<dyn std::error::Error>)?;
@@ -155,13 +208,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let state_file = matches.value_of("state").unwrap_or("eca_state.json");
     if std::path::Path::new(state_file).exists() {
-        let loading_animation = ThinkingAnimation::new(AnimationConfig {
+        let loading_animation = AnimationConfig {
             style: AnimationStyle::Progress,
             message: "Loading colony state".to_string(),
             delay: Duration::from_millis(50),
-        });
-        loading_animation.run().await?;
-        
+        };
+        run_animation(loading_animation).await?;
+
         match colony.load_state_from_file(state_file) {
             Ok(_) => println!("Loaded colony state from {}", state_file),
             Err(e) => eprintln!("Error loading state from {}: {}", state_file, e)
@@ -189,18 +242,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (init_tx, mut init_rx) = mpsc::channel::<Value>(100);
     let init_tx = Arc::new(init_tx);
 
-    let init_progress = ThinkingAnimation::new(AnimationConfig {
+    let init_progress = AnimationConfig {
         style: AnimationStyle::Progress,
         message: "Creating initial cells".to_string(),
         delay: Duration::from_millis(100),
-    });
+    };
 
     let init_animation_handle = tokio::spawn(async move {
-        init_progress.run().await
+        let init_anim = ThinkingAnimation::new(init_progress);
+        init_anim.run().await
     });
 
     let mut init_futures = Vec::new();
-    for cell_index in 0..initial_cells {
+    for cell_index in 0..config.initial_cells {
         if !running.load(Ordering::SeqCst) {
             break;
         }
@@ -243,7 +297,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "type": "initialization",
                 "message": format!(
                     "Initialized cell {} of {}:\n  Position: ({:.1}, {:.1}, {:.1})\n  Cell ID: {}\n  Energy: {:.1}",
-                    cell_index + 1, initial_cells,
+                    cell_index + 1, config.initial_cells,
                     position.x, position.y, position.z,
                     cell_id,
                     cell.energy
@@ -254,14 +308,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 eprintln!("Error sending initialization event: {}", e);
             }
 
-            time::sleep(Duration::from_millis(CELL_INIT_DELAY_MS)).await;
+            time::sleep(Duration::from_millis(config.cell_init_delay_ms)).await;
             cell_id
         });
 
         init_futures.push(future);
     }
 
-    let timeout_duration = Duration::from_secs(initial_cells as u64 * (CELL_INIT_DELAY_MS / 1000 + 1));
+    let timeout_duration = Duration::from_secs(config.initial_cells as u64 * (config.cell_init_delay_ms / 1000 + 1));
     match time::timeout(timeout_duration, future::join_all(init_futures)).await {
         Ok(results) => {
             for result in results {
@@ -308,47 +362,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             cell_ids = colony_guard.cells.keys().copied().collect();
         }
 
-        for batch_idx in (0..cell_ids.len()).step_by(BATCH_SIZE) {
+        // Process cells in batches
+        for batch_idx in (0..cell_ids.len()).step_by(config.batch_size) {
             if !running.load(Ordering::SeqCst) {
                 println!("Shutting down simulation...");
                 break 'main;
             }
 
-            let batch_animation = ThinkingAnimation::new(AnimationConfig {
+            let batch_message = format!("Processing batch {} of {}",
+                batch_idx / config.batch_size + 1,
+                (cell_ids.len() + config.batch_size - 1) / config.batch_size);
+            run_animation(AnimationConfig {
                 style: AnimationStyle::Spinner,
-                message: format!("Processing batch {} of {}", 
-                    batch_idx / BATCH_SIZE + 1, 
-                    (cell_ids.len() + BATCH_SIZE - 1) / BATCH_SIZE),
+                message: batch_message,
                 delay: Duration::from_millis(50),
-            });
-            batch_animation.run().await?;
+            }).await?;
 
-            let batch_end = (batch_idx + BATCH_SIZE).min(cell_ids.len());
+            let batch_end = (batch_idx + config.batch_size).min(cell_ids.len());
             let batch = cell_ids[batch_idx..batch_end].to_vec();
             if let Err(e) = colony.lock().unwrap().process_cell_batch(&batch).await {
                 eprintln!("Error processing cell batch: {}", e);
             }
         }
         
-        for batch_idx in (0..cell_ids.len()).step_by(BATCH_SIZE) {
-            let batch_end = (batch_idx + BATCH_SIZE).min(cell_ids.len());
+        // Plan creation phase
+        for batch_idx in (0..cell_ids.len()).step_by(config.batch_size) {
+            let batch_end = (batch_idx + config.batch_size).min(cell_ids.len());
             let batch = cell_ids[batch_idx..batch_end].to_vec();
-            
-            println!("
-╔════════════════════ PLAN GENERATION ═══════════════════╗");
-            println!("║ Batch {}/{} - Processing {} cells", 
-                batch_idx / BATCH_SIZE + 1, 
-                (cell_ids.len() + BATCH_SIZE - 1) / BATCH_SIZE,
+
+            println!("\n╔════════════════════ PLAN GENERATION ═══════════════════╗");
+            println!("║ Batch {}/{} - Processing {} cells",
+                batch_idx / config.batch_size + 1,
+                (cell_ids.len() + config.batch_size - 1) / config.batch_size,
                 batch.len()
             );
             println!("╠══════════════════════════════════════════════════════════╣");
 
-            let plan_animation = ThinkingAnimation::new(AnimationConfig {
+            let plan_message = format!("Creating plans for batch {}", batch_idx / config.batch_size + 1);
+            run_animation(AnimationConfig {
                 style: AnimationStyle::Progress,
-                message: format!("Creating plans for batch {}", batch_idx / BATCH_SIZE + 1),
+                message: plan_message,
                 delay: Duration::from_millis(50),
-            });
-            plan_animation.run().await?;
+            }).await?;
 
             if let Err(e) = colony.lock().unwrap().create_plans_batch(&batch, &current_cycle.to_string()).await {
                 eprintln!("Error creating plans batch: {}", e);
@@ -358,66 +413,58 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         
         // Evolution phase
-        let evolution_animation = ThinkingAnimation::new(AnimationConfig {
+        run_animation(AnimationConfig {
             style: AnimationStyle::Spinner,
             message: "Evolving cells".to_string(),
             delay: Duration::from_millis(80),
-        });
-        evolution_animation.run().await?;
-
+        }).await?;
         if let Err(e) = colony.lock().unwrap().evolve_cells().await {
             eprintln!("Error evolving cells: {}", e);
         }
 
-        let reproduction_animation = ThinkingAnimation::new(AnimationConfig {
+        run_animation(AnimationConfig {
             style: AnimationStyle::Progress,
             message: "Cell reproduction in progress".to_string(),
             delay: Duration::from_millis(60),
-        });
-        reproduction_animation.run().await?;
-
+        }).await?;
         if let Err(e) = colony.lock().unwrap().handle_cell_reproduction().await {
             eprintln!("Error handling cell reproduction: {}", e);
         }
 
-        let mission_animation = ThinkingAnimation::new(AnimationConfig {
+        run_animation(AnimationConfig {
             style: AnimationStyle::Spinner,
             message: "Updating mission progress".to_string(),
             delay: Duration::from_millis(70),
-        });
-        mission_animation.run().await?;
-
+        }).await?;
         if let Err(e) = colony.lock().unwrap().update_mission_progress().await {
             eprintln!("Error updating mission progress: {}", e);
         }
         
         // Memory compression (every other cycle)
         if current_cycle % 2 == 0 {
-            let compression_animation = ThinkingAnimation::new(AnimationConfig {
+            run_animation(AnimationConfig {
                 style: AnimationStyle::Progress,
                 message: "Compressing colony memories".to_string(),
                 delay: Duration::from_millis(50),
-            });
-            compression_animation.run().await?;
-
+            }).await?;
             if let Err(e) = colony.lock().unwrap().compress_colony_memories().await {
                 eprintln!("Error compressing colony memories: {}", e);
             }
         }
-        
+
         {
             let mut colony_guard = colony.lock().unwrap();
             colony_guard.print_cycle_statistics(current_cycle);
             if let Err(e) = colony_guard.save_state() {
                 eprintln!("Error saving state: {}", e);
             }
-            
+
             colony_guard.update_leaderboard();
             colony_guard.print_leaderboard();
         }
-        
+
         current_cycle += 1;
-        time::sleep(Duration::from_millis(CYCLE_DELAY_MS)).await;
+        time::sleep(Duration::from_millis(config.cycle_delay_ms)).await;
         
         // Spawn thinking animation task
         let animation_running = running.clone();
@@ -444,12 +491,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     
     colony.lock().unwrap().print_statistics();
     
-    let cleanup_animation = ThinkingAnimation::new(AnimationConfig {
+    run_animation(AnimationConfig {
         style: AnimationStyle::Progress,
         message: "Cleaning up resources".to_string(),
         delay: Duration::from_millis(100),
-    });
-    cleanup_animation.run().await?;
+    }).await?;
     
     // Resource cleanup
     drop(colony);
@@ -463,12 +509,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     
-    let completion_animation = ThinkingAnimation::new(AnimationConfig {
+    run_animation(AnimationConfig {
         style: AnimationStyle::Progress,
         message: "Shutdown complete".to_string(),
         delay: Duration::from_millis(150),
-    });
-    completion_animation.run().await?;
+    }).await?;
 
     println!("Shutdown complete");
     Ok(())
